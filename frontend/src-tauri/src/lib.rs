@@ -41,6 +41,7 @@ pub mod audio;
 pub mod config;
 pub mod console_utils;
 pub mod database;
+pub mod meeting_detector;
 pub mod notifications;
 pub mod ollama;
 pub mod onboarding;
@@ -53,6 +54,7 @@ pub mod state;
 pub mod summary;
 pub mod tray;
 pub mod utils;
+pub mod webhook;
 pub mod whisper_engine;
 
 use audio::{list_audio_devices, AudioDevice, trigger_audio_permission};
@@ -417,6 +419,7 @@ pub fn run() {
         )) as NotificationManagerState<tauri::Wry>)
         .manage(audio::init_system_audio_state())
         .manage(summary::summary_engine::ModelManagerState(Arc::new(tokio::sync::Mutex::new(None))))
+        .manage(meeting_detector::commands::init_meeting_detector_state())
         .setup(|_app| {
             log::info!("Application setup complete");
 
@@ -508,6 +511,16 @@ pub fn run() {
             } else {
                 log::warn!("Failed to resolve resource directory for templates");
             }
+
+            // Start meeting detection monitor on launch if it was left enabled
+            let app_for_meeting_detection = _app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                let detector_state = app_for_meeting_detection.state::<meeting_detector::commands::MeetingDetectorState>();
+                let detector = detector_state.read().await;
+                if detector.get_settings().await.enabled {
+                    detector.start_monitoring(app_for_meeting_detection.clone()).await;
+                }
+            });
 
             Ok(())
         })
@@ -748,6 +761,20 @@ pub fn run() {
             audio::import::start_import_audio_command,
             audio::import::cancel_import_command,
             audio::import::is_import_in_progress_command,
+            // Meeting detection commands
+            meeting_detector::commands::enable_meeting_detection,
+            meeting_detector::commands::disable_meeting_detection,
+            meeting_detector::commands::get_meeting_detection_status,
+            meeting_detector::commands::get_meeting_detection_settings,
+            meeting_detector::commands::set_meeting_detection_settings,
+            meeting_detector::commands::check_for_active_meeting,
+            meeting_detector::commands::start_meeting_monitor,
+            meeting_detector::commands::stop_meeting_monitor,
+            // Webhook commands
+            webhook::get_webhook_settings,
+            webhook::set_webhook_settings,
+            webhook::send_meeting_webhook,
+            webhook::test_webhook,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

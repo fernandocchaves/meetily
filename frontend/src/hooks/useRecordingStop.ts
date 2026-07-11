@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { useRouter } from 'next/navigation';
 import { listen } from '@tauri-apps/api/event';
+import { invoke } from '@tauri-apps/api/core';
 import { toast } from 'sonner';
 import { useTranscripts } from '@/contexts/TranscriptContext';
 import { useSidebar } from '@/components/Sidebar/SidebarProvider';
@@ -292,6 +293,26 @@ export function useRecordingStop(
           console.log('✅ Successfully saved COMPLETE meeting with ID:', meetingId);
           console.log('   Transcripts:', freshTranscripts.length);
           console.log('   folder_path:', folderPath);
+
+          // Fire the transcript webhook (e.g. to Hermes) — full transcript, no
+          // summary. Non-blocking: a failed/unconfigured webhook must never
+          // hold up saving/navigating to the meeting.
+          invoke('send_meeting_webhook', {
+            payload: {
+              meeting_id: String(meetingId),
+              title: savedMeetingName || meetingTitle || 'New Meeting',
+              started_at: null,
+              transcript: freshTranscripts.map(t => ({
+                text: t.text,
+                timestamp: t.timestamp,
+                audio_start_time: t.audio_start_time ?? null,
+                audio_end_time: t.audio_end_time ?? null,
+                duration: t.duration ?? null,
+              })),
+            },
+          }).catch(error => {
+            console.warn('Meeting webhook not sent:', error);
+          });
 
           // Mark meeting as saved in IndexedDB (for recovery system)
           await markMeetingAsSaved();
