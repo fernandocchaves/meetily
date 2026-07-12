@@ -80,7 +80,22 @@ return outputText"#;
 
     let raw = match output {
         Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).trim().to_string(),
-        _ => return EMPTY,
+        Ok(out) => {
+            // Nonzero exit is how a missing "Automation" permission for
+            // System Events shows up (System Settings > Privacy & Security
+            // > Automation > Meetily > System Events must be checked) —
+            // logged distinctly from "Teams not running"/"idle" so it's
+            // diagnosable instead of silently never detecting a meeting.
+            warn!(
+                "Teams window query failed (check Automation permission for System Events): {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+            return EMPTY;
+        }
+        Err(e) => {
+            warn!("Failed to run osascript for Teams window query: {}", e);
+            return EMPTY;
+        }
     };
 
     if raw.is_empty() {
