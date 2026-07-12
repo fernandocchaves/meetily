@@ -10,10 +10,34 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::path::PathBuf;
 use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System};
-use tauri::{AppHandle, Emitter, Runtime};
+use tauri::{AppHandle, Emitter, Manager, Runtime};
 use tokio::sync::RwLock;
 
-/// Checks whether Teams currently has an active-call window open.
+/// Result of inspecting Teams' own windows via System Events.
+#[cfg(target_os = "macos")]
+struct TeamsCallInfo {
+    window_count: usize,
+    /// Meeting subject, best-effort — the title segment of whichever window
+    /// isn't one of Teams' static left-nav tabs.
+    meeting_title: Option<String>,
+    /// Email of whichever account is currently active in Teams' account
+    /// switcher (the window title reflects the foregrounded account, which
+    /// is what matters when multiple accounts are signed into the same
+    /// window/switcher rather than separate app instances).
+    account_email: Option<String>,
+}
+
+#[cfg(target_os = "macos")]
+impl TeamsCallInfo {
+    fn is_active_call(&self) -> bool {
+        self.window_count > 1
+    }
+}
+
+/// Queries Teams' window titles via System Events (Accessibility/AppleEvents
+/// — the packaged app prompts for "Automation" permission for this the
+/// first time it runs, same one-time-approval pattern as the mic/screen
+/// recording permissions it already requests).
 ///
 /// The Teams process itself runs all day whenever the app is open — it is
 /// not, by itself, a signal that a meeting is in progress. Idle, Teams has
@@ -22,35 +46,112 @@ use tokio::sync::RwLock;
 /// UI mode (floating "Meeting compact view" widget, fullscreen, or
 /// backgrounded — all three were tested manually via System Events, and the
 /// window count was also confirmed live across a real join/leave cycle:
-/// count went 1→2 exactly at join, back to 1→exactly at leave). A window
-/// title substring match ("Meeting compact view") was tried first but only
-/// held for one of the three UI modes, so this checks window count instead.
+/// count went 1→2 exactly at join, back to 1 exactly at leave).
+///
+/// Window titles look like "<tab or meeting subject> | <org> | <account
+/// email> | Microsoft Teams" (floating-widget mode prefixes one window with
+/// "Meeting compact view | "). The meeting window is whichever one's first
+/// segment isn't a known static tab name — best-effort, not exhaustive
+/// (untested against non-English Teams UI locales).
 ///
 /// Known false-positive: a manually popped-out chat window also raises the
 /// count to 2+ without an active call. Accepted for now — same "best
 /// effort" spirit as the Google Meet detection below.
 #[cfg(target_os = "macos")]
-fn detect_teams_active_call() -> bool {
+fn query_teams_windows() -> TeamsCallInfo {
+    const EMPTY: TeamsCallInfo = TeamsCallInfo {
+        window_count: 0,
+        meeting_title: None,
+        account_email: None,
+    };
+
+    let script = r#"tell application "System Events" to tell process "MSTeams"
+    set windowNames to name of every window
+end tell
+set AppleScript's text item delimiters to "|||WINDOW|||"
+set outputText to windowNames as text
+set AppleScript's text item delimiters to ""
+return outputText"#;
+
     let output = std::process::Command::new("osascript")
         .arg("-e")
-        .arg(r#"tell application "System Events" to tell process "MSTeams" to count windows"#)
+        .arg(script)
         .output();
 
-    match output {
-        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout)
-            .trim()
-            .parse::<u32>()
-            .map(|n| n > 1)
-            .unwrap_or(false),
-        _ => false,
+    let raw = match output {
+        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).trim().to_string(),
+        _ => return EMPTY,
+    };
+
+    if raw.is_empty() {
+        return EMPTY;
+    }
+
+    const STATIC_TABS: &[&str] = &[
+        "Calendar",
+        "Chat",
+        "Activity",
+        "Teams",
+        "Calls",
+        "Files",
+        "Apps",
+        "Meeting compact view",
+    ];
+
+    let windows: Vec<&str> = raw.split("|||WINDOW|||").collect();
+    let window_count = windows.len();
+
+    let mut meeting_title = None;
+    let mut account_email = None;
+
+    for w in &windows {
+        let segments: Vec<&str> = w.split('|').map(|s| s.trim()).collect();
+        let Some(&first) = segments.first() else {
+            continue;
+        };
+
+        let title_segment = if first == "Meeting compact view" && segments.len() > 1 {
+            segments[1]
+        } else {
+            first
+        };
+
+        if !STATIC_TABS.contains(&title_segment) {
+            meeting_title = Some(title_segment.to_string());
+            account_email = segments.iter().find(|s| s.contains('@')).map(|s| s.to_string());
+            break;
+        }
+    }
+
+    TeamsCallInfo {
+        window_count,
+        meeting_title,
+        account_email,
     }
 }
 
 #[cfg(not(target_os = "macos"))]
-fn detect_teams_active_call() -> bool {
-    // No equivalent signal implemented yet on Windows/Linux — falls back to
-    // "Teams process is running" (the old, less precise behavior).
-    true
+struct TeamsCallInfo {
+    meeting_title: Option<String>,
+    account_email: Option<String>,
+}
+
+#[cfg(not(target_os = "macos"))]
+impl TeamsCallInfo {
+    fn is_active_call(&self) -> bool {
+        // No equivalent window-inspection signal implemented yet on
+        // Windows/Linux — falls back to "Teams process is running" (the
+        // old, less precise behavior) by always reporting active.
+        true
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn query_teams_windows() -> TeamsCallInfo {
+    TeamsCallInfo {
+        meeting_title: None,
+        account_email: None,
+    }
 }
 
 /// Represents a detected meeting
@@ -64,6 +165,14 @@ pub struct DetectedMeeting {
     pub detected_at: String,
     /// Whether this is an active meeting (vs just the app running)
     pub is_active_meeting: bool,
+    /// Meeting subject, when available (currently Teams only, macOS only)
+    #[serde(default)]
+    pub meeting_title: Option<String>,
+    /// Account email associated with the meeting, when available (currently
+    /// Teams only, macOS only — reflects whichever account is active in
+    /// Teams' account switcher)
+    #[serde(default)]
+    pub account_email: Option<String>,
 }
 
 /// Settings for meeting detection behavior
@@ -246,24 +355,31 @@ impl MeetingDetector {
                         process_name: process.name().to_string_lossy().to_string(),
                         detected_at: chrono::Local::now().to_rfc3339(),
                         is_active_meeting: true,
+                        meeting_title: None,
+                        account_email: None,
                     });
                 }
             }
 
             // Check for Microsoft Teams — process presence alone isn't enough
             // (Teams stays open all day); only report a meeting if there's
-            // also an active-call window (see detect_teams_active_call).
+            // also an active-call window (see query_teams_windows).
             if settings.detect_teams {
                 let teams_running = TEAMS_PROCESSES
                     .iter()
                     .any(|p| name.contains(&p.to_lowercase()));
-                if teams_running && detect_teams_active_call() {
-                    return Some(DetectedMeeting {
-                        app_name: "Microsoft Teams".to_string(),
-                        process_name: process.name().to_string_lossy().to_string(),
-                        detected_at: chrono::Local::now().to_rfc3339(),
-                        is_active_meeting: true,
-                    });
+                if teams_running {
+                    let call_info = query_teams_windows();
+                    if call_info.is_active_call() {
+                        return Some(DetectedMeeting {
+                            app_name: "Microsoft Teams".to_string(),
+                            process_name: process.name().to_string_lossy().to_string(),
+                            detected_at: chrono::Local::now().to_rfc3339(),
+                            is_active_meeting: true,
+                            meeting_title: call_info.meeting_title,
+                            account_email: call_info.account_email,
+                        });
+                    }
                 }
             }
 
@@ -384,8 +500,16 @@ impl MeetingDetector {
 
                         // Auto-start recording if enabled
                         if current_settings.auto_start_recording {
-                            let meeting_name =
-                                format!("{} Meeting", meeting_info.app_name);
+                            let meeting_name = match (
+                                &meeting_info.meeting_title,
+                                &meeting_info.account_email,
+                            ) {
+                                (Some(title), Some(account)) => {
+                                    format!("{} ({})", title, account)
+                                }
+                                (Some(title), None) => title.clone(),
+                                _ => format!("{} Meeting", meeting_info.app_name),
+                            };
                             info!("Auto-starting recording for: {}", meeting_name);
 
                             // Emit event for frontend to handle recording start
@@ -415,13 +539,49 @@ impl MeetingDetector {
                         // Emit event to frontend
                         let _ = app.emit("meeting-ended", ());
 
-                        // Auto-stop recording if enabled and we auto-started
+                        // Auto-stop recording if enabled and we auto-started.
+                        // Calls the same Rust stop_recording command the tray
+                        // menu uses directly (crate::audio::recording_commands),
+                        // then emits recording-stop-complete — the event
+                        // RecordingPostProcessingProvider already listens for
+                        // from every other stop source (tray, shortcut, main
+                        // UI). A frontend-only "auto-stop-recording" event
+                        // (the previous approach) never actually stopped the
+                        // backend recording, only ran post-processing on
+                        // whatever was already there.
                         if current_settings.auto_stop_recording
                             && auto_recording_active.load(Ordering::SeqCst)
                         {
                             info!("Auto-stopping recording");
-                            let _ = app.emit("auto-stop-recording", ());
                             auto_recording_active.store(false, Ordering::SeqCst);
+
+                            if let Ok(data_dir) = app.path().app_data_dir() {
+                                let timestamp = chrono::Local::now()
+                                    .format("%Y-%m-%dT%H-%M-%S")
+                                    .to_string();
+                                let save_path =
+                                    data_dir.join(format!("recording-{}.wav", timestamp));
+
+                                let stop_result = crate::audio::recording_commands::stop_recording(
+                                    app.clone(),
+                                    crate::audio::recording_commands::RecordingArgs {
+                                        save_path: save_path.to_string_lossy().to_string(),
+                                    },
+                                )
+                                .await;
+
+                                match stop_result {
+                                    Ok(_) => {
+                                        info!("Auto-stop: recording stopped successfully");
+                                        let _ = app.emit("recording-stop-complete", true);
+                                    }
+                                    Err(e) => {
+                                        error!("Auto-stop: failed to stop recording: {}", e);
+                                    }
+                                }
+                            } else {
+                                error!("Auto-stop: failed to resolve app data dir");
+                            }
                         }
 
                         was_in_meeting = false;
@@ -467,6 +627,8 @@ fn detect_meeting_from_system(
                     process_name: process.name().to_string_lossy().to_string(),
                     detected_at: chrono::Local::now().to_rfc3339(),
                     is_active_meeting: true,
+                    meeting_title: None,
+                    account_email: None,
                 });
             }
         }
@@ -476,13 +638,18 @@ fn detect_meeting_from_system(
             let teams_running = TEAMS_PROCESSES
                 .iter()
                 .any(|p| name.contains(&p.to_lowercase()));
-            if teams_running && detect_teams_active_call() {
-                return Some(DetectedMeeting {
-                    app_name: "Microsoft Teams".to_string(),
-                    process_name: process.name().to_string_lossy().to_string(),
-                    detected_at: chrono::Local::now().to_rfc3339(),
-                    is_active_meeting: true,
-                });
+            if teams_running {
+                let call_info = query_teams_windows();
+                if call_info.is_active_call() {
+                    return Some(DetectedMeeting {
+                        app_name: "Microsoft Teams".to_string(),
+                        process_name: process.name().to_string_lossy().to_string(),
+                        detected_at: chrono::Local::now().to_rfc3339(),
+                        is_active_meeting: true,
+                        meeting_title: call_info.meeting_title,
+                        account_email: call_info.account_email,
+                    });
+                }
             }
         }
     }

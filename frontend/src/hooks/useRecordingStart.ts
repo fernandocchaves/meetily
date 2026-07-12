@@ -232,7 +232,7 @@ export function useRecordingStart(
 
   // Listen for direct recording trigger from sidebar when already on home page
   useEffect(() => {
-    const handleDirectStart = async () => {
+    const handleDirectStart = async (event: Event) => {
       if (isRecording || isAutoStarting) {
         console.log('Recording already in progress, ignoring direct start event');
         return;
@@ -265,8 +265,11 @@ export function useRecordingStart(
       }
 
       try {
-        // Generate meeting title
-        const generatedMeetingTitle = generateMeetingTitle();
+        // Use the meeting title from the triggering event's detail (e.g.
+        // the real Teams meeting subject from auto-detect) when provided,
+        // otherwise fall back to the timestamp-based generated title.
+        const overrideTitle = (event as CustomEvent<{ meetingName?: string }>).detail?.meetingName;
+        const generatedMeetingTitle = overrideTitle || generateMeetingTitle();
 
         // Set STARTING status before initiating backend recording
         setStatus(RecordingStatus.STARTING, 'Initializing recording...');
