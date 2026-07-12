@@ -13,6 +13,46 @@ use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System};
 use tauri::{AppHandle, Emitter, Runtime};
 use tokio::sync::RwLock;
 
+/// Checks whether Teams currently has an active-call window open.
+///
+/// The Teams process itself runs all day whenever the app is open — it is
+/// not, by itself, a signal that a meeting is in progress. Idle, Teams has
+/// exactly one window (whatever tab is open — Calendar, Chat, etc). Joining
+/// a call always adds a second window for the meeting itself, regardless of
+/// UI mode (floating "Meeting compact view" widget, fullscreen, or
+/// backgrounded — all three were tested manually via System Events, and the
+/// window count was also confirmed live across a real join/leave cycle:
+/// count went 1→2 exactly at join, back to 1→exactly at leave). A window
+/// title substring match ("Meeting compact view") was tried first but only
+/// held for one of the three UI modes, so this checks window count instead.
+///
+/// Known false-positive: a manually popped-out chat window also raises the
+/// count to 2+ without an active call. Accepted for now — same "best
+/// effort" spirit as the Google Meet detection below.
+#[cfg(target_os = "macos")]
+fn detect_teams_active_call() -> bool {
+    let output = std::process::Command::new("osascript")
+        .arg("-e")
+        .arg(r#"tell application "System Events" to tell process "MSTeams" to count windows"#)
+        .output();
+
+    match output {
+        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .parse::<u32>()
+            .map(|n| n > 1)
+            .unwrap_or(false),
+        _ => false,
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn detect_teams_active_call() -> bool {
+    // No equivalent signal implemented yet on Windows/Linux — falls back to
+    // "Teams process is running" (the old, less precise behavior).
+    true
+}
+
 /// Represents a detected meeting
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DetectedMeeting {
@@ -210,17 +250,20 @@ impl MeetingDetector {
                 }
             }
 
-            // Check for Microsoft Teams
+            // Check for Microsoft Teams — process presence alone isn't enough
+            // (Teams stays open all day); only report a meeting if there's
+            // also an active-call window (see detect_teams_active_call).
             if settings.detect_teams {
-                for teams_process in TEAMS_PROCESSES {
-                    if name.contains(&teams_process.to_lowercase()) {
-                        return Some(DetectedMeeting {
-                            app_name: "Microsoft Teams".to_string(),
-                            process_name: process.name().to_string_lossy().to_string(),
-                            detected_at: chrono::Local::now().to_rfc3339(),
-                            is_active_meeting: true, // Teams process usually means active meeting
-                        });
-                    }
+                let teams_running = TEAMS_PROCESSES
+                    .iter()
+                    .any(|p| name.contains(&p.to_lowercase()));
+                if teams_running && detect_teams_active_call() {
+                    return Some(DetectedMeeting {
+                        app_name: "Microsoft Teams".to_string(),
+                        process_name: process.name().to_string_lossy().to_string(),
+                        detected_at: chrono::Local::now().to_rfc3339(),
+                        is_active_meeting: true,
+                    });
                 }
             }
 
@@ -428,17 +471,18 @@ fn detect_meeting_from_system(
             }
         }
 
-        // Check for Microsoft Teams
+        // Check for Microsoft Teams — same active-call window check as above.
         if settings.detect_teams {
-            for teams_process in TEAMS_PROCESSES {
-                if name.contains(&teams_process.to_lowercase()) {
-                    return Some(DetectedMeeting {
-                        app_name: "Microsoft Teams".to_string(),
-                        process_name: process.name().to_string_lossy().to_string(),
-                        detected_at: chrono::Local::now().to_rfc3339(),
-                        is_active_meeting: true,
-                    });
-                }
+            let teams_running = TEAMS_PROCESSES
+                .iter()
+                .any(|p| name.contains(&p.to_lowercase()));
+            if teams_running && detect_teams_active_call() {
+                return Some(DetectedMeeting {
+                    app_name: "Microsoft Teams".to_string(),
+                    process_name: process.name().to_string_lossy().to_string(),
+                    detected_at: chrono::Local::now().to_rfc3339(),
+                    is_active_meeting: true,
+                });
             }
         }
     }
