@@ -71,10 +71,14 @@ export class RecordingService {
     systemDeviceName: string | null,
     meetingName: string
   ): Promise<void> {
+    // Tauri v2 auto-converts #[tauri::command] snake_case Rust argument
+    // names to camelCase for the JS invoke() call (no rename_all override
+    // on this command) — snake_case keys here are silently ignored, and
+    // the Rust side just sees None for every argument instead of erroring.
     return invoke('start_recording_with_devices_and_meeting', {
-      mic_device_name: micDeviceName,
-      system_device_name: systemDeviceName,
-      meeting_name: meetingName
+      micDeviceName: micDeviceName,
+      systemDeviceName: systemDeviceName,
+      meetingName: meetingName
     });
   }
 

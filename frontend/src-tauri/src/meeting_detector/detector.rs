@@ -102,6 +102,11 @@ return outputText"#;
         return EMPTY;
     }
 
+    // Best-effort list of Teams/M365 nav tabs whose name isn't the meeting
+    // subject. Not exhaustive — any custom-pinned app tab not in this list
+    // could still be mistaken for a title (see known_org below for the
+    // structural check that catches the subject-less-call case regardless
+    // of this list's completeness).
     const STATIC_TABS: &[&str] = &[
         "Calendar",
         "Chat",
@@ -110,26 +115,38 @@ return outputText"#;
         "Calls",
         "Files",
         "Apps",
+        "SharePoint",
+        "OneDrive",
+        "Planner",
+        "Forms",
+        "Stream",
+        "Loop",
+        "Whiteboard",
+        "Viva Engage",
+        "Shifts",
+        "Approvals",
+        "Bookings",
+        "Tasks",
+        "To Do",
+        "Insights",
+        "Copilot",
+        "Games",
         "Meeting compact view",
     ];
 
     let windows: Vec<&str> = raw.split("|||WINDOW|||").collect();
     let window_count = windows.len();
+    info!("Teams windows ({}): {:?}", window_count, windows);
 
-    // A reference/idle window (title = a known static tab) has the shape
-    // "<tab> | <org> | <email> | Microsoft Teams" — segments[1] is the org
-    // name. Subject-less calls (e.g. "Meet now" with no title set) use that
-    // same org name as the meeting window's leading segment instead of a
-    // real subject; without this reference we'd mistake the org for the
-    // meeting title.
-    let mut known_org: Option<&str> = None;
-    for w in &windows {
+    // Every window's title ends "...<org> | <email> | Microsoft Teams" — the
+    // org is always 3rd-from-last, whether or not there's a leading
+    // tab/subject segment (a subject-less call's title just collapses to
+    // "<org> | <email> | Microsoft Teams", shifting org to the front).
+    // Structural, so it works even for tab names not in STATIC_TABS above.
+    let known_org: Option<&str> = windows.iter().find_map(|w| {
         let segments: Vec<&str> = w.split('|').map(|s| s.trim()).collect();
-        if segments.len() >= 2 && STATIC_TABS.contains(&segments[0]) {
-            known_org = Some(segments[1]);
-            break;
-        }
-    }
+        segments.len().checked_sub(3).map(|i| segments[i])
+    });
 
     let mut meeting_title = None;
     let mut account_email = None;

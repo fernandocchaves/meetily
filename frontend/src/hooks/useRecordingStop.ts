@@ -297,11 +297,14 @@ export function useRecordingStop(
           // Fire the transcript webhook (e.g. to Hermes) — full transcript, no
           // summary. Non-blocking: a failed/unconfigured webhook must never
           // hold up saving/navigating to the meeting.
+          const now = new Date();
+          const startedAt = `${String(now.getDate()).padStart(2, '0')}/${String(now.getMonth() + 1).padStart(2, '0')}/${now.getFullYear()}`;
+
           invoke('send_meeting_webhook', {
             payload: {
               meeting_id: String(meetingId),
               title: savedMeetingName || meetingTitle || 'New Meeting',
-              started_at: null,
+              started_at: startedAt,
               transcript: freshTranscripts.map(t => ({
                 text: t.text,
                 timestamp: t.timestamp,
