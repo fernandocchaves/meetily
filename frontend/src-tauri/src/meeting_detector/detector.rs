@@ -136,7 +136,7 @@ return outputText"#;
 
     let windows: Vec<&str> = raw.split("|||WINDOW|||").collect();
     let window_count = windows.len();
-    info!("Teams windows ({}): {:?}", window_count, windows);
+    debug!("Teams windows ({}): {:?}", window_count, windows);
 
     // Every window's title ends "...<org> | <email> | Microsoft Teams" — the
     // org is always 3rd-from-last, whether or not there's a leading
