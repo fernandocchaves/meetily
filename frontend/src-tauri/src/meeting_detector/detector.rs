@@ -121,11 +121,16 @@ return outputText"#;
 
     for w in &windows {
         let segments: Vec<&str> = w.split('|').map(|s| s.trim()).collect();
-        let Some(&first) = segments.first() else {
+        // Fewer than 2 segments means the window's title hasn't finished
+        // populating yet (still just "Microsoft Teams" or similar) — treat
+        // as not-ready rather than mistaking the placeholder for a real
+        // title (callers may retry shortly after).
+        if segments.len() < 2 {
             continue;
-        };
+        }
+        let first = segments[0];
 
-        let title_segment = if first == "Meeting compact view" && segments.len() > 1 {
+        let title_segment = if first == "Meeting compact view" && segments.len() > 2 {
             segments[1]
         } else {
             first
@@ -515,10 +520,44 @@ impl MeetingDetector {
 
                         // Auto-start recording if enabled
                         if current_settings.auto_start_recording {
-                            let meeting_name = match (
-                                &meeting_info.meeting_title,
-                                &meeting_info.account_email,
-                            ) {
+                            // Teams' meeting window is created before its
+                            // title finishes populating with the real
+                            // subject ("<title> | <org> | <email> |
+                            // Microsoft Teams") — a query right at
+                            // detection can still catch the bare app-name
+                            // placeholder. Retry briefly so the recording
+                            // gets a real title instead of the generic
+                            // fallback.
+                            #[cfg(target_os = "macos")]
+                            let (retried_title, retried_account) =
+                                if meeting_info.app_name == "Microsoft Teams"
+                                    && meeting_info.meeting_title.is_none()
+                                {
+                                    let mut title = None;
+                                    let mut account = None;
+                                    for _ in 0..4 {
+                                        tokio::time::sleep(Duration::from_millis(750)).await;
+                                        let info = query_teams_windows();
+                                        if info.meeting_title.is_some() {
+                                            title = info.meeting_title;
+                                            account = info.account_email;
+                                            break;
+                                        }
+                                    }
+                                    (title, account)
+                                } else {
+                                    (
+                                        meeting_info.meeting_title.clone(),
+                                        meeting_info.account_email.clone(),
+                                    )
+                                };
+                            #[cfg(not(target_os = "macos"))]
+                            let (retried_title, retried_account) = (
+                                meeting_info.meeting_title.clone(),
+                                meeting_info.account_email.clone(),
+                            );
+
+                            let meeting_name = match (&retried_title, &retried_account) {
                                 (Some(title), Some(account)) => {
                                     format!("{} ({})", title, account)
                                 }
