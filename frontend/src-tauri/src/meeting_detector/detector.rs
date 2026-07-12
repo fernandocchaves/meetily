@@ -116,6 +116,21 @@ return outputText"#;
     let windows: Vec<&str> = raw.split("|||WINDOW|||").collect();
     let window_count = windows.len();
 
+    // A reference/idle window (title = a known static tab) has the shape
+    // "<tab> | <org> | <email> | Microsoft Teams" — segments[1] is the org
+    // name. Subject-less calls (e.g. "Meet now" with no title set) use that
+    // same org name as the meeting window's leading segment instead of a
+    // real subject; without this reference we'd mistake the org for the
+    // meeting title.
+    let mut known_org: Option<&str> = None;
+    for w in &windows {
+        let segments: Vec<&str> = w.split('|').map(|s| s.trim()).collect();
+        if segments.len() >= 2 && STATIC_TABS.contains(&segments[0]) {
+            known_org = Some(segments[1]);
+            break;
+        }
+    }
+
     let mut meeting_title = None;
     let mut account_email = None;
 
@@ -128,19 +143,35 @@ return outputText"#;
         if segments.len() < 2 {
             continue;
         }
-        let first = segments[0];
 
+        // Account email is extracted independently of whether this window
+        // has a real meeting subject — a subject-less call ("Meet now"
+        // with no title set) still has a real signed-in account.
+        if account_email.is_none() {
+            account_email = segments.iter().find(|s| s.contains('@')).map(|s| s.to_string());
+        }
+
+        if meeting_title.is_some() {
+            continue;
+        }
+
+        let first = segments[0];
         let title_segment = if first == "Meeting compact view" && segments.len() > 2 {
             segments[1]
         } else {
             first
         };
 
-        if !STATIC_TABS.contains(&title_segment) {
-            meeting_title = Some(title_segment.to_string());
-            account_email = segments.iter().find(|s| s.contains('@')).map(|s| s.to_string());
-            break;
+        if STATIC_TABS.contains(&title_segment) {
+            continue;
         }
+        if Some(title_segment) == known_org {
+            // No real subject set for this call — leave meeting_title as
+            // None rather than mistaking the org name for the subject.
+            continue;
+        }
+
+        meeting_title = Some(title_segment.to_string());
     }
 
     TeamsCallInfo {
@@ -538,7 +569,13 @@ impl MeetingDetector {
                                     for _ in 0..4 {
                                         tokio::time::sleep(Duration::from_millis(750)).await;
                                         let info = query_teams_windows();
-                                        if info.meeting_title.is_some() {
+                                        // Stop as soon as the window is
+                                        // fully loaded (account present),
+                                        // even if there's genuinely no
+                                        // meeting subject to find — no
+                                        // point retrying a subject-less
+                                        // "Meet now" call 4 times.
+                                        if info.meeting_title.is_some() || info.account_email.is_some() {
                                             title = info.meeting_title;
                                             account = info.account_email;
                                             break;
@@ -562,7 +599,10 @@ impl MeetingDetector {
                                     format!("{} ({})", title, account)
                                 }
                                 (Some(title), None) => title.clone(),
-                                _ => format!("{} Meeting", meeting_info.app_name),
+                                (None, Some(account)) => {
+                                    format!("{} Meeting ({})", meeting_info.app_name, account)
+                                }
+                                (None, None) => format!("{} Meeting", meeting_info.app_name),
                             };
                             info!("Auto-starting recording for: {}", meeting_name);
 
